@@ -4,408 +4,350 @@
 #include <cuda_runtime.h>
 
 // Define array size
-#define N 16000000  // 16M elements
+#define N (32 * 1024 * 1024)  // 32M elements
 #define THREADS_PER_BLOCK 256
+#define BLOCKS ((N + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK)
 
-// Kernel demonstrating coalesced memory access
+// Utility function for checking CUDA errors
+#define CHECK_CUDA_ERROR(call) \
+do { \
+    cudaError_t err = call; \
+    if (err != cudaSuccess) { \
+        printf("CUDA Error: %s at line %d\n", cudaGetErrorString(err), __LINE__); \
+        exit(1); \
+    } \
+} while(0)
+
+// =========================================================================
+// KERNEL 1: Perfectly coalesced memory access
+// All threads in a warp access consecutive memory locations
+// =========================================================================
 __global__ void coalesced_access(float* input, float* output) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
     if (idx < N) {
-        // Threads with consecutive IDs access consecutive memory locations
-        // This is COALESCED access - optimal performance
+        // Each thread accesses consecutive memory locations
+        // All threads in a warp (32 threads) access a contiguous chunk of memory
+        // This allows the GPU hardware to combine these accesses into fewer transactions
         output[idx] = input[idx] * 2.0f;
     }
 }
 
-// Kernel demonstrating non-coalesced (strided) memory access
+// =========================================================================
+// KERNEL 2: Strided memory access (non-coalesced)
+// Threads access memory with a stride, causing inefficient memory access patterns
+// =========================================================================
 __global__ void strided_access(float* input, float* output, int stride) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
-    if (idx * stride < N) {
-        // Threads with consecutive IDs access memory locations that are 'stride' elements apart
-        // This is NON-COALESCED access - poor performance
-        output[idx] = input[idx * stride] * 2.0f;
+    if (idx < N) {
+        // Calculate strided access pattern
+        // This causes threads within the same warp to access memory locations far apart
+        // The hardware cannot coalesce these into fewer transactions
+        int strided_idx = (idx * stride) % N;
+        output[idx] = input[strided_idx] * 2.0f;
     }
 }
 
-// Kernel demonstrating Array of Structures (AoS) - typically not coalesced
-__global__ void aos_access(float4* input, float4* output) {
+// =========================================================================
+// KERNEL 3: Bank conflict demonstration with shared memory
+// =========================================================================
+__global__ void shared_memory_bank_conflicts(float* input, float* output, int stride) {
+    __shared__ float shared_data[THREADS_PER_BLOCK];
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Load into shared memory - coalesced global memory access
+    if (idx < N) {
+        shared_data[threadIdx.x] = input[idx];
+    }
+    __syncthreads();
+
+    // Access shared memory with potential bank conflicts depending on stride
+    if (idx < N) {
+        int bank_idx = (threadIdx.x * stride) % THREADS_PER_BLOCK;
+        float value = shared_data[bank_idx];
+        output[idx] = value * 2.0f;
+    }
+}
+
+// =========================================================================
+// KERNEL 4: Misaligned access
+// Starting from a non-aligned address, causing partial coalescing
+// =========================================================================
+__global__ void misaligned_access(float* input, float* output, int offset) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < N - offset) {
+        // Offset causes misalignment at the warp level
+        output[idx] = input[idx + offset] * 2.0f;
+    }
+}
+
+// =========================================================================
+// KERNEL 5: Structure of Arrays (SoA) vs Array of Structures (AoS)
+// =========================================================================
+typedef struct {
+    float x, y, z, w;  // 4 floats representing a vector4
+} Vector4;
+
+__global__ void aos_access(Vector4* input, Vector4* output) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < N/4) {  // We have N/4 Vector4 elements
+        // Each thread processes one Vector4
+        // BUT: when the 32 threads in a warp access their x components,
+        // they are accessing non-contiguous memory locations
+        Vector4 v = input[idx];
+        v.x *= 2.0f;
+        v.y *= 2.0f;
+        v.z *= 2.0f;
+        v.w *= 2.0f;
+        output[idx] = v;
+    }
+}
+
+__global__ void soa_access(float* x, float* y, float* z, float* w,
+                          float* x_out, float* y_out, float* z_out, float* w_out) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
     if (idx < N/4) {
-        // Each thread processes one float4 structure
-        float4 val = input[idx];
-
-        // Process each component
-        val.x *= 2.0f;
-        val.y *= 2.0f;
-        val.z *= 2.0f;
-        val.w *= 2.0f;
-
-        output[idx] = val;
-    }
-}
-
-// Kernel demonstrating Structure of Arrays (SoA) - coalesced
-__global__ void soa_access(float* input_x, float* input_y, float* input_z, float* input_w,
-                          float* output_x, float* output_y, float* output_z, float* output_w) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (idx < N/4) {
-        // Each thread accesses the same component from different structures
-        // This results in coalesced memory access
-        output_x[idx] = input_x[idx] * 2.0f;
-        output_y[idx] = input_y[idx] * 2.0f;
-        output_z[idx] = input_z[idx] * 2.0f;
-        output_w[idx] = input_w[idx] * 2.0f;
-    }
-}
-
-// Kernel demonstrating matrix transpose with non-coalesced memory access
-__global__ void matrix_transpose_naive(float* input, float* output, int width) {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-
-    if (x < width && y < width) {
-        // Reading is coalesced (consecutive threads read consecutive elements)
-        // Writing is NOT coalesced (consecutive threads write to elements that are 'width' apart)
-        output[x * width + y] = input[y * width + x];
-    }
-}
-
-// Kernel demonstrating matrix transpose with shared memory to improve coalescing
-__global__ void matrix_transpose_shared(float* input, float* output, int width) {
-    __shared__ float tile[32][32];  // Shared memory tile
-
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-
-    // Local indices within the block
-    int local_x = threadIdx.x;
-    int local_y = threadIdx.y;
-
-    if (x < width && y < width) {
-        // Load data from input (coalesced read)
-        tile[local_y][local_x] = input[y * width + x];
-    }
-
-    __syncthreads();  // Ensure all threads have loaded data
-
-    // Determine output coordinates (transposed)
-    int out_x = blockIdx.y * blockDim.y + local_x;
-    int out_y = blockIdx.x * blockDim.x + local_y;
-
-    if (out_x < width && out_y < width) {
-        // Store to output (now coalesced write because we're reading from shared memory transposed)
-        output[out_y * width + out_x] = tile[local_x][local_y];
-    }
-}
-
-// Kernel demonstrating vectorized memory access (most optimal)
-__global__ void vectorized_access(float4* input, float4* output) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (idx < N/4) {
-        // Load 4 floats at once - this is both coalesced AND uses vector load instructions
-        float4 val = input[idx];
-
-        // Process 4 values at once
-        val.x *= 2.0f;
-        val.y *= 2.0f;
-        val.z *= 2.0f;
-        val.w *= 2.0f;
-
-        // Store 4 floats at once
-        output[idx] = val;
+        // Each thread processes one element from each array
+        // When the 32 threads in a warp access their x components,
+        // they're accessing contiguous memory locations
+        x_out[idx] = x[idx] * 2.0f;
+        y_out[idx] = y[idx] * 2.0f;
+        z_out[idx] = z[idx] * 2.0f;
+        w_out[idx] = w[idx] * 2.0f;
     }
 }
 
 int main() {
+    size_t size = N * sizeof(float);
     float *h_input, *h_output;
     float *d_input, *d_output;
-    float4 *h_input4, *h_output4;
-    float4 *d_input4, *d_output4;
-    float *d_input_x, *d_input_y, *d_input_z, *d_input_w;
-    float *d_output_x, *d_output_y, *d_output_z, *d_output_w;
 
     // Allocate host memory
-    h_input = (float*)malloc(N * sizeof(float));
-    h_output = (float*)malloc(N * sizeof(float));
+    h_input = (float*)malloc(size);
+    h_output = (float*)malloc(size);
 
-    // Initialize input data
+    // Initialize host array
     for (int i = 0; i < N; i++) {
         h_input[i] = (float)i;
     }
 
     // Allocate device memory
-    cudaMalloc(&d_input, N * sizeof(float));
-    cudaMalloc(&d_output, N * sizeof(float));
+    CHECK_CUDA_ERROR(cudaMalloc((void**)&d_input, size));
+    CHECK_CUDA_ERROR(cudaMalloc((void**)&d_output, size));
 
-    // Copy input data to device
-    cudaMemcpy(d_input, h_input, N * sizeof(float), cudaMemcpyHostToDevice);
+    // Copy data to device
+    CHECK_CUDA_ERROR(cudaMemcpy(d_input, h_input, size, cudaMemcpyHostToDevice));
 
-    // Create CUDA events for timing
+    // CUDA events for timing
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
+    float milliseconds = 0;
 
-    // Calculate grid dimensions
-    int blocks = (N + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+    printf("=================================================================\n");
+    printf("CUDA Memory Coalescing Demonstration\n");
+    printf("Array size: %d elements (%zu MB)\n", N, size / (1024 * 1024));
+    printf("=================================================================\n\n");
 
-    printf("Testing memory access patterns with array size: %d\n", N);
-    printf("-------------------------------------------------------\n");
-
-    // --------------------------------------------------------------------
+    // =========================================================================
     // Test 1: Coalesced access
-    cudaEventRecord(start);
-
-    coalesced_access<<<blocks, THREADS_PER_BLOCK>>>(d_input, d_output);
-
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-
-    float coalesced_time = 0;
-    cudaEventElapsedTime(&coalesced_time, start, stop);
-
-    // --------------------------------------------------------------------
-    // Test 2: Strided access (non-coalesced)
-    int stride = 32;  // Stride of 32 elements - terrible for coalescing!
-    blocks = ((N / stride) + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+    // =========================================================================
+    printf("Running Kernel 1: Coalesced access\n");
 
     cudaEventRecord(start);
-
-    strided_access<<<blocks, THREADS_PER_BLOCK>>>(d_input, d_output, stride);
-
+    coalesced_access<<<BLOCKS, THREADS_PER_BLOCK>>>(d_input, d_output);
     cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
 
-    float strided_time = 0;
-    cudaEventElapsedTime(&strided_time, start, stop);
+    CHECK_CUDA_ERROR(cudaEventSynchronize(stop));
+    cudaEventElapsedTime(&milliseconds, start, stop);
 
-    // --------------------------------------------------------------------
-    // Test 3: AoS vs SoA
-    // Allocate memory for AoS test
-    h_input4 = (float4*)malloc(N/4 * sizeof(float4));
-    h_output4 = (float4*)malloc(N/4 * sizeof(float4));
+    printf("Execution time: %.3f ms\n", milliseconds);
+    printf("Effective bandwidth: %.2f GB/s\n\n",
+           (2 * size) / (milliseconds * 1.0e6));
 
-    // Initialize input for AoS test
+    // =========================================================================
+    // Test 2: Strided access pattern
+    // =========================================================================
+    printf("Running Kernel 2: Strided access (stride = 32)\n");
+
+    // Stride of 32 means threads in the same warp access memory 32 elements apart
+    // This is extremely inefficient for memory coalescing
+    int stride = 32;
+
+    cudaEventRecord(start);
+    strided_access<<<BLOCKS, THREADS_PER_BLOCK>>>(d_input, d_output, stride);
+    cudaEventRecord(stop);
+
+    CHECK_CUDA_ERROR(cudaEventSynchronize(stop));
+    cudaEventElapsedTime(&milliseconds, start, stop);
+
+    printf("Execution time: %.3f ms\n", milliseconds);
+    printf("Effective bandwidth: %.2f GB/s\n\n",
+           (2 * size) / (milliseconds * 1.0e6));
+
+    // =========================================================================
+    // Test 3: Shared memory bank conflicts
+    // =========================================================================
+    printf("Running Kernel 3: Shared memory bank conflicts (stride = 32)\n");
+
+    cudaEventRecord(start);
+    shared_memory_bank_conflicts<<<BLOCKS, THREADS_PER_BLOCK>>>(d_input, d_output, stride);
+    cudaEventRecord(stop);
+
+    CHECK_CUDA_ERROR(cudaEventSynchronize(stop));
+    cudaEventElapsedTime(&milliseconds, start, stop);
+
+    printf("Execution time: %.3f ms\n", milliseconds);
+    printf("Effective bandwidth: %.2f GB/s\n\n",
+           (2 * size) / (milliseconds * 1.0e6));
+
+    // =========================================================================
+    // Test 4: Misaligned access
+    // =========================================================================
+    printf("Running Kernel 4: Misaligned access (offset = 1)\n");
+
+    // Offset of 1 causes memory accesses to be misaligned at warp boundaries
+    int offset = 1;
+
+    cudaEventRecord(start);
+    misaligned_access<<<BLOCKS, THREADS_PER_BLOCK>>>(d_input, d_output, offset);
+    cudaEventRecord(stop);
+
+    CHECK_CUDA_ERROR(cudaEventSynchronize(stop));
+    cudaEventElapsedTime(&milliseconds, start, stop);
+
+    printf("Execution time: %.3f ms\n", milliseconds);
+    printf("Effective bandwidth: %.2f GB/s\n\n",
+           (2 * size) / (milliseconds * 1.0e6));
+
+    // =========================================================================
+    // Test 5: Structure of Arrays (SoA) vs Array of Structures (AoS)
+    // =========================================================================
+
+    // Free previous allocations
+    CHECK_CUDA_ERROR(cudaFree(d_input));
+    CHECK_CUDA_ERROR(cudaFree(d_output));
+
+    // Setup for AoS test
+    Vector4 *h_aos_input = (Vector4*)malloc(N/4 * sizeof(Vector4));
+    Vector4 *h_aos_output = (Vector4*)malloc(N/4 * sizeof(Vector4));
+
     for (int i = 0; i < N/4; i++) {
-        h_input4[i].x = (float)(i * 4);
-        h_input4[i].y = (float)(i * 4 + 1);
-        h_input4[i].z = (float)(i * 4 + 2);
-        h_input4[i].w = (float)(i * 4 + 3);
+        h_aos_input[i].x = (float)i;
+        h_aos_input[i].y = (float)i + 0.1f;
+        h_aos_input[i].z = (float)i + 0.2f;
+        h_aos_input[i].w = (float)i + 0.3f;
     }
 
-    // Allocate device memory for AoS test
-    cudaMalloc(&d_input4, N/4 * sizeof(float4));
-    cudaMalloc(&d_output4, N/4 * sizeof(float4));
+    Vector4 *d_aos_input, *d_aos_output;
+    CHECK_CUDA_ERROR(cudaMalloc((void**)&d_aos_input, N/4 * sizeof(Vector4)));
+    CHECK_CUDA_ERROR(cudaMalloc((void**)&d_aos_output, N/4 * sizeof(Vector4)));
+    CHECK_CUDA_ERROR(cudaMemcpy(d_aos_input, h_aos_input, N/4 * sizeof(Vector4), cudaMemcpyHostToDevice));
 
-    // Copy input data to device for AoS test
-    cudaMemcpy(d_input4, h_input4, N/4 * sizeof(float4), cudaMemcpyHostToDevice);
+    printf("Running Kernel 5a: Array of Structures (AoS) access\n");
 
-    // Allocate device memory for SoA test
-    cudaMalloc(&d_input_x, N/4 * sizeof(float));
-    cudaMalloc(&d_input_y, N/4 * sizeof(float));
-    cudaMalloc(&d_input_z, N/4 * sizeof(float));
-    cudaMalloc(&d_input_w, N/4 * sizeof(float));
-    cudaMalloc(&d_output_x, N/4 * sizeof(float));
-    cudaMalloc(&d_output_y, N/4 * sizeof(float));
-    cudaMalloc(&d_output_z, N/4 * sizeof(float));
-    cudaMalloc(&d_output_w, N/4 * sizeof(float));
+    cudaEventRecord(start);
+    aos_access<<<BLOCKS/4, THREADS_PER_BLOCK>>>(d_aos_input, d_aos_output);
+    cudaEventRecord(stop);
 
-    // Extract components from AoS and copy to device for SoA test
-    float *h_comp_x = (float*)malloc(N/4 * sizeof(float));
-    float *h_comp_y = (float*)malloc(N/4 * sizeof(float));
-    float *h_comp_z = (float*)malloc(N/4 * sizeof(float));
-    float *h_comp_w = (float*)malloc(N/4 * sizeof(float));
+    CHECK_CUDA_ERROR(cudaEventSynchronize(stop));
+    cudaEventElapsedTime(&milliseconds, start, stop);
+
+    printf("Execution time: %.3f ms\n", milliseconds);
+    printf("Effective bandwidth: %.2f GB/s\n\n",
+           (2 * N/4 * sizeof(Vector4)) / (milliseconds * 1.0e6));
+
+    // Setup for SoA test
+    float *h_x, *h_y, *h_z, *h_w;
+    float *h_x_out, *h_y_out, *h_z_out, *h_w_out;
+
+    h_x = (float*)malloc(N/4 * sizeof(float));
+    h_y = (float*)malloc(N/4 * sizeof(float));
+    h_z = (float*)malloc(N/4 * sizeof(float));
+    h_w = (float*)malloc(N/4 * sizeof(float));
+    h_x_out = (float*)malloc(N/4 * sizeof(float));
+    h_y_out = (float*)malloc(N/4 * sizeof(float));
+    h_z_out = (float*)malloc(N/4 * sizeof(float));
+    h_w_out = (float*)malloc(N/4 * sizeof(float));
 
     for (int i = 0; i < N/4; i++) {
-        h_comp_x[i] = h_input4[i].x;
-        h_comp_y[i] = h_input4[i].y;
-        h_comp_z[i] = h_input4[i].z;
-        h_comp_w[i] = h_input4[i].w;
+        h_x[i] = (float)i;
+        h_y[i] = (float)i + 0.1f;
+        h_z[i] = (float)i + 0.2f;
+        h_w[i] = (float)i + 0.3f;
     }
 
-    cudaMemcpy(d_input_x, h_comp_x, N/4 * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_input_y, h_comp_y, N/4 * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_input_z, h_comp_z, N/4 * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_input_w, h_comp_w, N/4 * sizeof(float), cudaMemcpyHostToDevice);
+    float *d_x, *d_y, *d_z, *d_w;
+    float *d_x_out, *d_y_out, *d_z_out, *d_w_out;
 
-    // Test AoS
-    blocks = (N/4 + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+    CHECK_CUDA_ERROR(cudaMalloc((void**)&d_x, N/4 * sizeof(float)));
+    CHECK_CUDA_ERROR(cudaMalloc((void**)&d_y, N/4 * sizeof(float)));
+    CHECK_CUDA_ERROR(cudaMalloc((void**)&d_z, N/4 * sizeof(float)));
+    CHECK_CUDA_ERROR(cudaMalloc((void**)&d_w, N/4 * sizeof(float)));
+    CHECK_CUDA_ERROR(cudaMalloc((void**)&d_x_out, N/4 * sizeof(float)));
+    CHECK_CUDA_ERROR(cudaMalloc((void**)&d_y_out, N/4 * sizeof(float)));
+    CHECK_CUDA_ERROR(cudaMalloc((void**)&d_z_out, N/4 * sizeof(float)));
+    CHECK_CUDA_ERROR(cudaMalloc((void**)&d_w_out, N/4 * sizeof(float)));
 
-    cudaEventRecord(start);
+    CHECK_CUDA_ERROR(cudaMemcpy(d_x, h_x, N/4 * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK_CUDA_ERROR(cudaMemcpy(d_y, h_y, N/4 * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK_CUDA_ERROR(cudaMemcpy(d_z, h_z, N/4 * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK_CUDA_ERROR(cudaMemcpy(d_w, h_w, N/4 * sizeof(float), cudaMemcpyHostToDevice));
 
-    aos_access<<<blocks, THREADS_PER_BLOCK>>>(d_input4, d_output4);
-
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-
-    float aos_time = 0;
-    cudaEventElapsedTime(&aos_time, start, stop);
-
-    // Test SoA
-    cudaEventRecord(start);
-
-    soa_access<<<blocks, THREADS_PER_BLOCK>>>(d_input_x, d_input_y, d_input_z, d_input_w,
-                                         d_output_x, d_output_y, d_output_z, d_output_w);
-
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-
-    float soa_time = 0;
-    cudaEventElapsedTime(&soa_time, start, stop);
-
-    // --------------------------------------------------------------------
-    // Test 4: Matrix transpose
-
-    // Matrix size (we'll use a square matrix)
-    int width = 4096;
-    int matrix_size = width * width * sizeof(float);
-
-    // Allocate memory for matrix transpose test
-    float *h_matrix = (float*)malloc(matrix_size);
-    float *h_transposed = (float*)malloc(matrix_size);
-    float *d_matrix, *d_transposed;
-
-    // Initialize matrix
-    for (int i = 0; i < width * width; i++) {
-        h_matrix[i] = (float)i;
-    }
-
-    // Allocate device memory for matrix transpose test
-    cudaMalloc(&d_matrix, matrix_size);
-    cudaMalloc(&d_transposed, matrix_size);
-
-    // Copy matrix to device
-    cudaMemcpy(d_matrix, h_matrix, matrix_size, cudaMemcpyHostToDevice);
-
-    // Grid and block dimensions for matrix transpose
-    dim3 block_dim(32, 32);
-    dim3 grid_dim((width + block_dim.x - 1) / block_dim.x, 
-                  (width + block_dim.y - 1) / block_dim.y);
-
-    // Test naive transpose (non-coalesced writes)
-    cudaEventRecord(start);
-
-    matrix_transpose_naive<<<grid_dim, block_dim>>>(d_matrix, d_transposed, width);
-
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-
-    float naive_transpose_time = 0;
-    cudaEventElapsedTime(&naive_transpose_time, start, stop);
-
-    // Test shared memory transpose (improved coalescing)
-    cudaEventRecord(start);
-
-    matrix_transpose_shared<<<grid_dim, block_dim>>>(d_matrix, d_transposed, width);
-
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-
-    float shared_transpose_time = 0;
-    cudaEventElapsedTime(&shared_transpose_time, start, stop);
-
-    // --------------------------------------------------------------------
-    // Test 5: Vectorized access
-    blocks = (N/4 + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+    printf("Running Kernel 5b: Structure of Arrays (SoA) access\n");
 
     cudaEventRecord(start);
-
-    vectorized_access<<<blocks, THREADS_PER_BLOCK>>>(d_input4, d_output4);
-
+    soa_access<<<BLOCKS/4, THREADS_PER_BLOCK>>>(d_x, d_y, d_z, d_w, d_x_out, d_y_out, d_z_out, d_w_out);
     cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
 
-    float vectorized_time = 0;
-    cudaEventElapsedTime(&vectorized_time, start, stop);
+    CHECK_CUDA_ERROR(cudaEventSynchronize(stop));
+    cudaEventElapsedTime(&milliseconds, start, stop);
 
-    // --------------------------------------------------------------------
-    // Print results
-    printf("Test Results:\n");
-    printf("1. Coalesced access:         %.3f ms\n", coalesced_time);
-    printf("2. Strided access (stride=%d): %.3f ms\n", stride, strided_time);
-    printf("   Slowdown vs. coalesced:   %.2fx\n", strided_time / coalesced_time);
-    printf("\n");
-    printf("3. Array of Structures:      %.3f ms\n", aos_time);
-    printf("   Structure of Arrays:      %.3f ms\n", soa_time);
-    printf("   AoS vs. SoA speedup:      %.2fx\n", aos_time / soa_time);
-    printf("\n");
-    printf("4. Matrix transpose (naive): %.3f ms\n", naive_transpose_time);
-    printf("   Matrix transpose (shared): %.3f ms\n", shared_transpose_time);
-    printf("   Shared memory speedup:    %.2fx\n", naive_transpose_time / shared_transpose_time);
-    printf("\n");
-    printf("5. Vectorized access:        %.3f ms\n", vectorized_time);
-    printf("   Speedup vs. coalesced:    %.2fx\n", coalesced_time / vectorized_time);
+    printf("Execution time: %.3f ms\n", milliseconds);
+    printf("Effective bandwidth: %.2f GB/s\n\n",
+           (2 * 4 * N/4 * sizeof(float)) / (milliseconds * 1.0e6));
 
-    // --------------------------------------------------------------------
-    // Clean up
-    cudaFree(d_input);
-    cudaFree(d_output);
-    cudaFree(d_input4);
-    cudaFree(d_output4);
-    cudaFree(d_input_x);
-    cudaFree(d_input_y);
-    cudaFree(d_input_z);
-    cudaFree(d_input_w);
-    cudaFree(d_output_x);
-    cudaFree(d_output_y);
-    cudaFree(d_output_z);
-    cudaFree(d_output_w);
-    cudaFree(d_matrix);
-    cudaFree(d_transposed);
+    // =========================================================================
+    // Cleanup
+    // =========================================================================
 
+    // Free CUDA event resources
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
+    // Free device memory for AoS test
+    CHECK_CUDA_ERROR(cudaFree(d_aos_input));
+    CHECK_CUDA_ERROR(cudaFree(d_aos_output));
+
+    // Free device memory for SoA test
+    CHECK_CUDA_ERROR(cudaFree(d_x));
+    CHECK_CUDA_ERROR(cudaFree(d_y));
+    CHECK_CUDA_ERROR(cudaFree(d_z));
+    CHECK_CUDA_ERROR(cudaFree(d_w));
+    CHECK_CUDA_ERROR(cudaFree(d_x_out));
+    CHECK_CUDA_ERROR(cudaFree(d_y_out));
+    CHECK_CUDA_ERROR(cudaFree(d_z_out));
+    CHECK_CUDA_ERROR(cudaFree(d_w_out));
+
+    // Free host memory
     free(h_input);
     free(h_output);
-    free(h_input4);
-    free(h_output4);
-    free(h_comp_x);
-    free(h_comp_y);
-    free(h_comp_z);
-    free(h_comp_w);
-    free(h_matrix);
-    free(h_transposed);
+    free(h_aos_input);
+    free(h_aos_output);
+    free(h_x);
+    free(h_y);
+    free(h_z);
+    free(h_w);
+    free(h_x_out);
+    free(h_y_out);
+    free(h_z_out);
+    free(h_w_out);
 
+    printf("Tests complete!\n");
     return 0;
 }
-
-/* 
-Compilation and Run:
-$ nvcc -o memory_coalescing 05_memory_coalescing.cu
-$ ./memory_coalescing
-
-Memory Coalescing Principles:
-
-1. What is Memory Coalescing?
-   - Memory coalescing is when threads in the same warp access contiguous memory
-   - The GPU can combine multiple memory requests into a single transaction
-   - Coalesced access can be 10-30x faster than non-coalesced
-
-2. Rules for Coalesced Access:
-   - Threads with consecutive IDs should access consecutive memory locations
-   - Memory should be properly aligned (e.g., 128-byte boundary for optimal access)
-   - Access patterns should generally follow the structure of the thread indexing
-
-3. Common Non-Coalesced Patterns to Avoid:
-   - Strided access (threads access memory with gaps between elements)
-   - Misaligned access (starting address not aligned to appropriate boundary)
-   - Irregular access patterns (threads access random memory locations)
-   - Array of Structures (AoS) instead of Structure of Arrays (SoA)
-   - Column-major access in row-major stored arrays (or vice versa)
-
-4. Advanced Techniques:
-   - Use shared memory to reorganize non-coalesced patterns
-   - Use vectorized loads/stores (float4, int4) for higher throughput
-   - Transpose matrices in shared memory when necessary
-   - Use padding to ensure alignment when needed
-   - Consider SoA layout instead of AoS for better coalescing
-
-Experiment Ideas:
-1. Try different stride values to see the impact on performance
-2. Experiment with different matrix sizes for the transpose test
-3. Try implementing a 2D stencil computation with and without coalescing
-4. Analyze the impact of memory coalescing on different GPU architectures
-5. Combine memory coalescing with other optimization techniques
-*/
